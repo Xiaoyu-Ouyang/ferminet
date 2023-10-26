@@ -54,7 +54,7 @@ def default() -> ml_collections.ConfigDict:
       'config_module': __name__,
       'optim': {
           'objective': 'vmc',  # objective type. Either 'vmc' or 'wqmc'
-          'iterations': 10000,  # number of iterations
+          'iterations': 1000000,  # number of iterations
           'optimizer': 'kfac',  # one of adam, kfac, lamb, none
           'lr': {
               'rate': 0.05,  # learning rate
