@@ -16,8 +16,9 @@
 
 import functools
 import importlib
+import os
 import time
-from typing import Optional, Sequence, Tuple, Union
+from typing import Optional, Mapping, Sequence, Tuple, Union
 
 from absl import logging
 import chex
@@ -29,10 +30,12 @@ from ferminet import hamiltonian
 from ferminet import loss as qmc_loss_functions
 from ferminet import mcmc
 from ferminet import networks
+from ferminet import observables
 from ferminet import pretrain
 from ferminet import psiformer
 from ferminet.utils import statistics
 from ferminet.utils import system
+from ferminet.utils import utils
 from ferminet.utils import writers
 import jax
 from jax.experimental import multihost_utils
@@ -52,12 +55,13 @@ def _assign_spin_configuration(
   return jnp.tile(spins[None], reps=(batch_size, 1))
 
 
-def init_electrons(
+def init_electrons(  # pylint: disable=dangerous-default-value
     key,
     molecule: Sequence[system.Atom],
     electrons: Sequence[int],
     batch_size: int,
     init_width: float,
+    core_electrons: Mapping[str, int] = {},
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
   """Initializes electron positions around each atom.
 
@@ -69,6 +73,8 @@ def init_electrons(
       devices.
     init_width: width of (atom-centred) Gaussian used to generate initial
       electron configurations.
+    core_electrons: mapping of element symbol to number of core electrons
+      included in the pseudopotential.
 
   Returns:
     array of (batch_size, (nalpha+nbeta)*ndim) of initial (random) electron
@@ -77,7 +83,9 @@ def init_electrons(
     of spin configurations, where 1 and -1 indicate alpha and beta electrons
     respectively.
   """
-  if sum(atom.charge for atom in molecule) != sum(electrons):
+  total_electrons = sum(atom.charge - core_electrons.get(atom.symbol, 0)
+                        for atom in molecule)
+  if total_electrons != sum(electrons):
     if len(molecule) == 1:
       atomic_spin_configs = [electrons]
     else:
@@ -85,7 +93,9 @@ def init_electrons(
                                 'exists for charged molecules.')
   else:
     atomic_spin_configs = [
-        (atom.element.nalpha, atom.element.nbeta) for atom in molecule
+        (atom.element.nalpha - core_electrons.get(atom.symbol, 0) // 2,
+         atom.element.nbeta - core_electrons.get(atom.symbol, 0) // 2)
+        for atom in molecule
     ]
     assert sum(sum(x) for x in atomic_spin_configs) == sum(electrons)
     while tuple(sum(x) for x in zip(*atomic_spin_configs)) != electrons:
@@ -243,6 +253,7 @@ def make_loss_step(evaluate_loss: qmc_loss_functions.LossFn) -> OptUpdate:
 def make_training_step(
     mcmc_step,
     optimizer_step: OptUpdate,
+    reset_if_nan: bool = False,
 ) -> Step:
   """Factory to create traning step for non-KFAC optimizers.
 
@@ -251,6 +262,8 @@ def make_training_step(
       for creating the callable.
     optimizer_step: OptUpdate callable which evaluates the forward and backward
       passes and updates the parameters and optimizer state, as required.
+    reset_if_nan: If true, reset the params and opt state to the state at the
+      previous step when the loss is NaN
 
   Returns:
     step, a callable which performs a set of MCMC steps and then an optimization
@@ -270,15 +283,27 @@ def make_training_step(
     data, pmove = mcmc_step(params, data, mcmc_key, mcmc_width)
 
     # Optimization step
-    new_params, state, loss, aux_data = optimizer_step(params, data, state,
-                                                       loss_key)
-    return data, new_params, state, loss, aux_data, pmove
+    new_params, new_state, loss, aux_data = optimizer_step(params,
+                                                           data,
+                                                           state,
+                                                           loss_key)
+    if reset_if_nan:
+      new_params = jax.lax.cond(jnp.isnan(loss),
+                                lambda: params,
+                                lambda: new_params)
+      new_state = jax.lax.cond(jnp.isnan(loss),
+                               lambda: state,
+                               lambda: new_state)
+    return data, new_params, new_state, loss, aux_data, pmove
 
   return step
 
 
-def make_kfac_training_step(mcmc_step, damping: float,
-                            optimizer: kfac_jax.Optimizer) -> Step:
+def make_kfac_training_step(
+    mcmc_step,
+    damping: float,
+    optimizer: kfac_jax.Optimizer,
+    reset_if_nan: bool = False) -> Step:
   """Factory to create traning step for KFAC optimizers.
 
   Args:
@@ -286,6 +311,8 @@ def make_kfac_training_step(mcmc_step, damping: float,
       for creating the callable.
     damping: value of damping to use for each KFAC update step.
     optimizer: KFAC optimizer instance.
+    reset_if_nan: If true, reset the params and opt state to the state at the
+      previous step when the loss is NaN
 
   Returns:
     step, a callable which performs a set of MCMC steps and then an optimization
@@ -295,6 +322,10 @@ def make_kfac_training_step(mcmc_step, damping: float,
   shared_mom = kfac_jax.utils.replicate_all_local_devices(jnp.zeros([]))
   shared_damping = kfac_jax.utils.replicate_all_local_devices(
       jnp.asarray(damping))
+  # Due to some KFAC cleverness related to donated buffers, need to do this
+  # to make state resettable
+  copy_tree = constants.pmap(
+      functools.partial(jax.tree_util.tree_map, lambda x: 1.0 * x))
 
   def step(
       data: networks.FermiNetData,
@@ -311,8 +342,12 @@ def make_kfac_training_step(mcmc_step, damping: float,
     mcmc_keys, loss_keys = kfac_jax.utils.p_split(key)
     data, pmove = mcmc_step(params, data, mcmc_keys, mcmc_width)
 
+    if reset_if_nan:
+      old_params = copy_tree(params)
+      old_state = copy_tree(state)
+
     # Optimization step
-    new_params, state, stats = optimizer.step(
+    new_params, new_state, stats = optimizer.step(
         params=params,
         state=state,
         rng=loss_keys,
@@ -320,7 +355,11 @@ def make_kfac_training_step(mcmc_step, damping: float,
         momentum=shared_mom,
         damping=shared_damping,
     )
-    return data, new_params, state, stats['loss'], stats['aux'], pmove
+
+    if reset_if_nan and jnp.isnan(stats['loss']):
+      new_params = old_params
+      new_state = old_state
+    return data, new_params, new_state, stats['loss'], stats['aux'], pmove
 
   return step
 
@@ -340,6 +379,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   # Device logging
   num_devices = jax.local_device_count()
   num_hosts = jax.device_count() // num_devices
+  num_states = cfg.system.get('states', 0) or 1  # avoid 0/1 confusion
   logging.info('Starting QMC with %i XLA devices per host '
                'across %i hosts.', num_devices, num_hosts)
   if cfg.batch_size % (num_devices * num_hosts) != 0:
@@ -347,6 +387,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
                      f'got batch size {cfg.batch_size} for '
                      f'{num_devices * num_hosts} devices.')
   host_batch_size = cfg.batch_size // num_hosts  # batch size per host
+  total_host_batch_size = host_batch_size * num_states
   device_batch_size = host_batch_size // num_devices  # batch size per device
   data_shape = (num_devices, device_batch_size)
 
@@ -381,7 +422,8 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         molecule=cfg.system.molecule,
         nspins=nspins,
         restricted=False,
-        basis=cfg.pretrain.basis)
+        basis=cfg.pretrain.basis,
+        states=cfg.system.states)
     # broadcast the result of PySCF from host 0 to all other hosts
     hartree_fock.mean_field.mo_coeff = multihost_utils.broadcast_one_to_all(
         hartree_fock.mean_field.mo_coeff
@@ -422,6 +464,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         charges,
         ndim=cfg.system.ndim,
         determinants=cfg.network.determinants,
+        states=cfg.system.states,
         envelope=envelope,
         feature_layer=feature_layer,
         jastrow=cfg.network.get('jastrow', 'default'),
@@ -437,6 +480,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         charges,
         ndim=cfg.system.ndim,
         determinants=cfg.network.determinants,
+        states=cfg.system.states,
         envelope=envelope,
         feature_layer=feature_layer,
         jastrow=cfg.network.get('jastrow', 'default'),
@@ -450,7 +494,12 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   params = kfac_jax.utils.replicate_all_local_devices(params)
   signed_network = network.apply
   # Often just need log|psi(x)|.
-  logabs_network = lambda *args, **kwargs: signed_network(*args, **kwargs)[1]
+  if cfg.system.get('states', 0):
+    logabs_network = utils.select_output(
+        networks.make_total_ansatz(signed_network,
+                                   cfg.system.get('states', 0)), 1)
+  else:
+    logabs_network = lambda *args, **kwargs: signed_network(*args, **kwargs)[1]
   batch_network = jax.vmap(
       logabs_network, in_axes=(None, 0, 0, 0, 0), out_axes=0
   )  # batched network
@@ -481,23 +530,43 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
       checkpoint.find_last_checkpoint(ckpt_restore_path))
 
   if ckpt_restore_filename:
-    t_init, data, params, opt_state_ckpt, mcmc_width_ckpt = checkpoint.restore(
-        ckpt_restore_filename, host_batch_size)
+    (t_init,
+     data,
+     params,
+     opt_state_ckpt,
+     mcmc_width_ckpt,
+     density_state_ckpt) = checkpoint.restore(
+         ckpt_restore_filename, host_batch_size)
   else:
     logging.info('No checkpoint found. Training new model.')
     key, subkey = jax.random.split(key)
     # make sure data on each host is initialized differently
     subkey = jax.random.fold_in(subkey, jax.process_index())
+    # extract number of electrons of each spin around each atom removed because
+    # of pseudopotentials
+    if cfg.system.pyscf_mol:
+      cfg.system.pyscf_mol.build()
+      core_electrons = {
+          atom: ecp_table[0]
+          for atom, ecp_table in cfg.system.pyscf_mol._ecp.items()  # pylint: disable=protected-access
+      }
+    else:
+      core_electrons = {}
+    # create electron state (position and spin)
     pos, spins = init_electrons(
         subkey,
         cfg.system.molecule,
         cfg.system.electrons,
-        batch_size=host_batch_size,
+        batch_size=total_host_batch_size,
         init_width=cfg.mcmc.init_width,
+        core_electrons=core_electrons,
     )
-    pos = jnp.reshape(pos, data_shape + pos.shape[1:])
+    # For excited states, each device has a batch of walkers, where each walker
+    # is nstates * nelectrons. The vmap over nstates is handled in the function
+    # created in make_total_ansatz
+    pos = jnp.reshape(pos, data_shape + (-1,))
     pos = kfac_jax.utils.broadcast_all_local_devices(pos)
-    spins = jnp.reshape(spins, data_shape + spins.shape[1:])
+    spins = jnp.reshape(spins, data_shape + (-1,))
     spins = kfac_jax.utils.broadcast_all_local_devices(spins)
     data = networks.FermiNetData(
         positions=pos, spins=spins, atoms=batch_atoms, charges=batch_charges
@@ -506,9 +575,58 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     t_init = 0
     opt_state_ckpt = None
     mcmc_width_ckpt = None
+    density_state_ckpt = None
 
-  # Set up logging
+  # Set up logging and observables
   train_schema = ['step', 'energy', 'ewmean', 'ewvar', 'pmove']
+
+  if cfg.system.states:
+    energy_matrix_file = open(
+        os.path.join(ckpt_save_path, 'energy_matrix.npy'), 'ab')
+
+  observable_fns = {}
+  observable_states = {}  # only relevant for density matrix
+  if cfg.observables.s2:
+    observable_fns['s2'] = observables.make_s2(
+        signed_network,
+        nspins,
+        states=cfg.system.states)
+    observable_states['s2'] = None
+    train_schema += ['s2']
+    if cfg.system.states:
+      s2_matrix_file = open(
+          os.path.join(ckpt_save_path, 's2_matrix.npy'), 'ab')
+  if cfg.observables.dipole:
+    observable_fns['dipole'] = observables.make_dipole(
+        signed_network,
+        states=cfg.system.states)
+    observable_states['dipole'] = None
+    train_schema += ['mu_x', 'mu_y', 'mu_z']
+    if cfg.system.states:
+      dipole_matrix_file = open(
+          os.path.join(ckpt_save_path, 'dipole_matrix.npy'), 'ab')
+  # Do this *before* creating density matrix function, as that is a special case
+  observable_fns = observables.make_observable_fns(observable_fns)
+
+  if cfg.observables.density:
+    (observable_states['density'],
+     density_update,
+     observable_fns['density']) = observables.make_density_matrix(
+         signed_network, data.positions, cfg, density_state_ckpt)
+    # Because the density matrix can be quite large, even without excited
+    # states, we always save it directly to .npy file instead of writing to CSV
+    density_matrix_file = open(
+        os.path.join(ckpt_save_path, 'density_matrix.npy'), 'ab')
+    # custom pmaping just for density matrix function
+    pmap_density_axes = observables.DensityState(t=None,
+                                                 positions=0,
+                                                 probabilities=0,
+                                                 move_width=0,
+                                                 pmove=None,
+                                                 mo_coeff=None)
+    pmap_fn = constants.pmap(observable_fns['density'],
+                             in_axes=(0, 0, pmap_density_axes))
+    observable_fns['density'] = lambda *a, **kw: pmap_fn(*a, **kw).mean(0)
 
   # Initialisation done. We now want to have different PRNG streams on each
   # device. Shard the key over devices
@@ -539,6 +657,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         electrons=cfg.system.electrons,
         scf_approx=hartree_fock,
         iterations=cfg.pretrain.iterations,
+        states=cfg.system.states,
     )
 
   # Main training
@@ -550,10 +669,14 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
       device_batch_size,
       steps=cfg.mcmc.steps,
       atoms=atoms_to_mcmc,
-      blocks=cfg.mcmc.blocks,
+      blocks=cfg.mcmc.blocks * num_states,
   )
   # Construct loss and optimizer
+  laplacian_method = cfg.optim.get('laplacian', 'default')
   if cfg.system.make_local_energy_fn:
+    if laplacian_method != 'default':
+      raise NotImplementedError(f'Laplacian method {laplacian_method}'
+                                'not yet supported by custom local energy fns.')
     local_energy_module, local_energy_fn = (
         cfg.system.make_local_energy_fn.rsplit('.', maxsplit=1))
     local_energy_module = importlib.import_module(local_energy_module)
@@ -563,14 +686,20 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         charges=charges,
         nspins=nspins,
         use_scan=False,
+        states=cfg.system.get('states', 0),
         **cfg.system.make_local_energy_kwargs)
   else:
+    pp_symbols = cfg.system.get('pp', {'symbols': None}).get('symbols')
     local_energy = hamiltonian.local_energy(
         f=signed_network,
         charges=charges,
         nspins=nspins,
         use_scan=False,
-        complex_output=cfg.network.get('complex', False))
+        complex_output=cfg.network.get('complex', False),
+        laplacian_method=laplacian_method,
+        states=cfg.system.get('states', 0),
+        pp_type=cfg.system.get('pp', {'type': 'ccecp'}).get('type'),
+        pp_symbols=pp_symbols if cfg.system.get('use_pp') else None)
   if cfg.optim.objective == 'vmc':
     evaluate_loss = qmc_loss_functions.make_loss(
         log_network if cfg.network.get('complex', False) else logabs_network,
@@ -652,12 +781,14 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     opt_state = opt_state_ckpt or opt_state  # avoid overwriting ckpted state
     step = make_training_step(
         mcmc_step=mcmc_step,
-        optimizer_step=make_opt_update_step(evaluate_loss, optimizer))
+        optimizer_step=make_opt_update_step(evaluate_loss, optimizer),
+        reset_if_nan=cfg.optim.reset_if_nan)
   elif isinstance(optimizer, kfac_jax.Optimizer):
     step = make_kfac_training_step(
         mcmc_step=mcmc_step,
         damping=cfg.optim.kfac.damping,
-        optimizer=optimizer)
+        optimizer=optimizer,
+        reset_if_nan=cfg.optim.reset_if_nan)
   else:
     raise ValueError(f'Unknown optimizer: {optimizer}')
 
@@ -709,9 +840,10 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         log=False)
   with writer_manager as writer:
     # Main training loop
+    num_resets = 0  # used if reset_if_nan is true
     for t in range(t_init, cfg.optim.iterations):
       sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
-      data, params, opt_state, loss, unused_aux_data, pmove = step(
+      data, params, opt_state, loss, aux_data, pmove = step(
           data,
           params,
           opt_state,
@@ -727,35 +859,87 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
           alpha=0.1, observation=loss, previous_stats=weighted_stats)
       pmove = pmove[0]
 
+      # Update observables
+      observable_data = {
+          key: fn(params, data, observable_states[key])
+          for key, fn in observable_fns.items()
+      }
+      if cfg.observables.density:
+        sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
+        observable_states['density'] = density_update(
+            subkeys, params, data, observable_states['density'])
+
       # Update MCMC move width
-      if t > 0 and t % cfg.mcmc.adapt_frequency == 0:
-        if np.mean(pmoves) > 0.55:
-          mcmc_width *= 1.1
-        if np.mean(pmoves) < 0.5:
-          mcmc_width /= 1.1
-        pmoves[:] = 0
-      pmoves[t%cfg.mcmc.adapt_frequency] = pmove
+      mcmc_width, pmoves = mcmc.update_mcmc_width(
+          t, mcmc_width, cfg.mcmc.adapt_frequency, pmove, pmoves)
 
       if cfg.debug.check_nan:
         tree = {'params': params, 'loss': loss}
         if cfg.optim.optimizer != 'none':
           tree['optim'] = opt_state
-        chex.assert_tree_all_finite(tree)
+        try:
+          chex.assert_tree_all_finite(tree)
+          num_resets = 0  # Reset counter if check passes
+        except AssertionError as e:
+          if cfg.optim.reset_if_nan:  # Allow a certain number of NaNs
+            num_resets += 1
+            if num_resets > 100:
+              raise e
+          else:
+            raise e
 
       # Logging
       if t % cfg.log.stats_frequency == 0:
-        logging.info(
-            'Step %05d: %03.4f E_h, exp. variance=%03.4f E_h^2, pmove=%0.2f', t,
-            loss, weighted_stats.variance, pmove)
-        writer.write(
-            t,
-            step=t,
-            energy=np.asarray(loss),
-            ewmean=np.asarray(weighted_stats.mean),
-            ewvar=np.asarray(weighted_stats.variance),
-            pmove=np.asarray(pmove))
+        logging_str = ('Step %05d: '
+                       '%03.4f E_h, exp. variance=%03.4f E_h^2, pmove=%0.2f')
+        logging_args = t, loss, weighted_stats.variance, pmove
+        writer_kwargs = {
+            'step': t,
+            'energy': np.asarray(loss),
+            'ewmean': np.asarray(weighted_stats.mean),
+            'ewvar': np.asarray(weighted_stats.variance),
+            'pmove': np.asarray(pmove),
+        }
+        for key in observable_data:
+          obs_data = observable_data[key]
+          if cfg.system.states:
+            obs_data = np.trace(obs_data, axis1=-1, axis2=-2)
+          if key == 'dipole':
+            writer_kwargs['mu_x'] = obs_data[0]
+            writer_kwargs['mu_y'] = obs_data[1]
+            writer_kwargs['mu_z'] = obs_data[2]
+          elif key == 'density':
+            pass
+          elif key == 's2':
+            writer_kwargs[key] = obs_data
+            logging_str += ', <S^2>=%03.4f'
+            logging_args += obs_data,
+        logging.info(logging_str, *logging_args)
+        writer.write(t, **writer_kwargs)
+
+      # Log data about observables too big to fit in a CSV
+      if cfg.system.states:
+        energy_matrix = aux_data.local_energy_mat
+        energy_matrix = np.nanmean(np.nanmean(energy_matrix, axis=0), axis=0)
+        np.save(energy_matrix_file, energy_matrix)
+        if cfg.observables.s2:
+          np.save(s2_matrix_file, observable_data['s2'])
+        if cfg.observables.dipole:
+          np.save(dipole_matrix_file, observable_data['dipole'])
+      if cfg.observables.density:
+        np.save(density_matrix_file, observable_data['density'])
 
       # Checkpointing
       if time.time() - time_of_last_ckpt > cfg.log.save_frequency * 60:
         checkpoint.save(ckpt_save_path, t, data, params, opt_state, mcmc_width)
         time_of_last_ckpt = time.time()
+
+    # Shut down logging at end
+    if cfg.system.states:
+      energy_matrix_file.close()
+      if cfg.observables.s2:
+        s2_matrix_file.close()
+      if cfg.observables.dipole:
+        dipole_matrix_file.close()
+    if cfg.observables.density:
+      density_matrix_file.close()

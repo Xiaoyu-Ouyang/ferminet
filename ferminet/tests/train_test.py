@@ -49,14 +49,29 @@ def setUpModule():
 
 
 def _config_params():
-  for system, optimizer, complex_ in itertools.product(
-      ('Li', 'LiH'), ('kfac', 'adam'), (True, False)):
-    yield {'system': system, 'optimizer': optimizer, 'complex_': complex_}
+  for system, optimizer, complex_, states in itertools.product(
+      ('Li', 'LiH'), ('kfac', 'adam'), (True, False), (0, 2)):
+    if states == 0 or not complex_:
+      yield {'system': system,
+             'optimizer': optimizer,
+             'complex_': complex_,
+             'states': states,
+             'laplacian': 'default'}
   for optimizer in ('kfac', 'adam', 'lamb', 'none'):
     yield {
         'system': 'H' if optimizer in ('kfac', 'adam') else 'Li',
         'optimizer': optimizer,
         'complex_': False,
+        'states': 0,
+        'laplacian': 'default',
+    }
+  for states, laplacian in itertools.product((0, 2), ('default', 'folx')):
+    yield {
+        'system': 'Li',
+        'optimizer': 'kfac',
+        'complex_': False,
+        'states': states,
+        'laplacian': laplacian
     }
 
 
@@ -70,7 +85,7 @@ class QmcTest(parameterized.TestCase):
     pyscf.lib.param.TMPDIR = None
 
   @parameterized.parameters(_config_params())
-  def test_training_step(self, system, optimizer, complex_):
+  def test_training_step(self, system, optimizer, complex_, states, laplacian):
     if system in ('H', 'Li'):
       cfg = atom.get_config()
       cfg.system.atom = system
@@ -81,11 +96,16 @@ class QmcTest(parameterized.TestCase):
     cfg.network.determinants = 2
     cfg.network.complex = complex_
     cfg.batch_size = 32
+    cfg.system.states = states
     cfg.pretrain.iterations = 10
     cfg.mcmc.burn_in = 10
     cfg.optim.optimizer = optimizer
+    cfg.optim.laplacian = laplacian
     cfg.optim.iterations = 3
     cfg.debug.check_nan = True
+    cfg.observables.s2 = True
+    cfg.observables.dipole = True
+    cfg.observables.density = True
     cfg.log.save_path = self.create_tempdir().full_path
     cfg = base_config.resolve(cfg)
     # Calculation is too small to test the results for accuracy. Test just to
@@ -128,6 +148,37 @@ class QmcPyscfMolTest(parameterized.TestCase):
     cfg.mcmc.burn_in = 10
     cfg.mcmc.blocks = mcmc_blocks
     cfg.optim.optimizer = optimizer
+    cfg.optim.iterations = 3
+    cfg.debug.check_nan = True
+    cfg.log.save_path = self.create_tempdir().full_path
+    cfg = base_config.resolve(cfg)
+    # Calculation is too small to test the results for accuracy. Test just to
+    # ensure they actually run without a top-level error.
+    train.train(cfg)
+
+  @parameterized.parameters([{'states': 0}, {'states': 3}])
+  def test_pseudopotential_step(self, states):
+    cfg = base_config.default()
+    mol = pyscf.gto.Mole()
+    mol.atom = ['Li 0 0 0']
+    mol.basis = {'Li': cfg.system.pp.basis}
+    mol.ecp = {'Li': cfg.system.pp.type}
+
+    mol.charge = 0
+    mol.spin = 1
+    mol.unit = 'angstrom'
+    mol.build()
+    cfg.system.pyscf_mol = mol
+
+    cfg.network.ferminet.hidden_dims = ((16, 4),) * 2
+    cfg.network.determinants = 2
+    cfg.batch_size = 32
+    cfg.pretrain.iterations = 0
+    cfg.mcmc.burn_in = 0
+    cfg.system.use_pp = True
+    cfg.system.pp.symbols = ['Li']
+    cfg.system.states = states
+    cfg.system.electrons = (1, 0)
     cfg.optim.iterations = 3
     cfg.debug.check_nan = True
     cfg.log.save_path = self.create_tempdir().full_path

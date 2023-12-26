@@ -32,7 +32,7 @@ class JastrowType(enum.Enum):
 def _jastrow_ee(
     r_ee: jnp.ndarray,
     params: ParamTree,
-    nspins: jnp.ndarray,
+    nspins: tuple[int, int],
     jastrow_fun: Callable[[jnp.ndarray, float, jnp.ndarray], jnp.ndarray],
 ) -> jnp.ndarray:
   """Jastrow factor for electron-electron cusps."""
@@ -80,7 +80,9 @@ def make_simple_ee_jastrow() -> ...:
     return params
 
   def apply(
-      r_ee: jnp.ndarray, params: ParamTree, nspins: jnp.ndarray
+      r_ee: jnp.ndarray,
+      params: ParamTree,
+      nspins: tuple[int, int],
   ) -> jnp.ndarray:
     """Jastrow factor for electron-electron cusps."""
     return _jastrow_ee(r_ee, params, nspins, jastrow_fun=simple_ee_cusp_fun)
