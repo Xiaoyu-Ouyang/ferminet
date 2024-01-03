@@ -54,8 +54,9 @@ def default() -> ml_collections.ConfigDict:
       'config_module': __name__,
       'optim': {
           'objective': 'vmc',  # objective type. Either 'vmc' or 'wqmc'
-          'iterations': 1000000,  # number of iterations
+          'iterations': 1000,  # number of iterations
           'optimizer': 'kfac',  # one of adam, kfac, lamb, none
+          'laplacian': 'default',  # of of default or folx (for forward lapl)
           'lr': {
               'rate': 0.05,  # learning rate
               'decay': 1.0,  # exponent of learning rate decay
@@ -72,6 +73,10 @@ def default() -> ml_collections.ConfigDict:
           # average clipped energy rather than average energy, guaranteeing that
           # the average energy difference will be zero in each batch.
           'center_at_clip': True,
+          # If true, keep the parameters and optimizer state from the previous
+          # step and revert them if they become NaN after an update. Mainly
+          # useful for excited states
+          'reset_if_nan': False,
           # KFAC hyperparameters. See KFAC documentation for details.
           'kfac': {
               'invert_every': 1,
@@ -127,10 +132,28 @@ def default() -> ml_collections.ConfigDict:
           # Dimensionality. Change with care. FermiNet implementation currently
           # assumes 3D systems.
           'ndim': 3,
+          # Number of excited states. If 0, use normal ground state machinery.
+          # If 1, compute ground state using excited state machinery. If >1,
+          # compute that many excited states.
+          'states': 0,
           # Units of *input* coords of atoms. Either 'bohr' or
           # 'angstrom'. Internally work in a.u.; positions in
           # Angstroms are converged to Bohr.
           'units': 'bohr',
+          # If true, use pseudopotentials
+          'use_pp': False,
+          # Config for pseudopotential if cfg.system.pp is True
+          'pp': {
+              # If a pseudopotential is used, specify which. Ignored if no
+              # pseudopotential is used.
+              'type': 'ccecp',
+              # If a pseudopotential is used, specify the basis set. Ignored if
+              # no pseudopotential is used.
+              'basis': 'ccecp-cc-pVDZ',
+              # If a pseudopotential is used, list the symbols of elements for
+              # which it will be used.
+              'symbols': None,
+          },
           # 2. Specify the system using pyscf. Must be a pyscf.gto.Mole object.
           'pyscf_mol': None,
           # 3. Specify the system inside a function evaluated after the config
@@ -252,6 +275,12 @@ def default() -> ml_collections.ConfigDict:
           'make_envelope_fn': '',
           'make_envelope_kwargs': {},
       },
+      'observables': {
+          's2': True,  # spin magnitude
+          'density': True,  # density matrix
+          'density_basis': 'def2-tzvpd',  # basis used for DM calculation
+          'dipole': True,  # dipole moment
+      },
       'debug': {
           # Check optimizer state, parameters and loss and raise an exception if
           # NaN is found.
@@ -261,7 +290,7 @@ def default() -> ml_collections.ConfigDict:
       'pretrain': {
           'method': 'hf',  # Currently only 'hf' is supported.
           'iterations': 1000,  # Only used if method is 'hf'.
-          'basis': 'sto-6g',
+          'basis': 'ccpvdz',  # Larger than STO-6G, but good for excited states
       },
   })
 

@@ -44,7 +44,7 @@ def default() -> ml_collections.ConfigDict:
   """
   # wavefunction output.
   cfg = ml_collections.ConfigDict({
-      'batch_size': 256,  # batch size
+      'batch_size': 4096,  # batch size
       # Config module used. Should be set in get_config function as either the
       # absolute module or relative to the configs subdirectory. Relative
       # imports must start with a '.' (e.g. .atom). Do *not* override on
@@ -277,9 +277,9 @@ def default() -> ml_collections.ConfigDict:
       },
       'observables': {
           's2': True,  # spin magnitude
-          'density': True,  # density matrix
+          'density': False,  # density matrix
           'density_basis': 'def2-tzvpd',  # basis used for DM calculation
-          'dipole': True,  # dipole moment
+          'dipole': False,  # dipole moment
       },
       'debug': {
           # Check optimizer state, parameters and loss and raise an exception if
