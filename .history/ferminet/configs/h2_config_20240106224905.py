@@ -8,7 +8,7 @@ def get_config():
   cfg = base_config.default()
   # Set up molecule
   cfg.system.electrons = (1,1)
-  cfg.system.molecule = [system.Atom('H', (0, 0, -0.7)), system.Atom('H', (0, 0, 0.7))]
+  cfg.system.molecule = [system.Atom('H', (0, 0, -0.7)), system.Atom('H', (0, 0, 1))]
 
   # Set training hyperparameters
   cfg.batch_size = 256
